@@ -67,6 +67,7 @@ footer{max-width:960px;margin:0 auto;padding:0 16px 24px;color:var(--muted);font
     <div class="row">
       <button id="recBtn">● 録音開始</button>
       <label class="filebtn">音声/動画ファイルを開く<input type="file" id="fileIn" accept="audio/*,video/*"></label>
+      <button id="resetBtn">↺ リセット</button>
       <div class="meter" title="入力レベル"><i id="meterBar"></i></div>
       <span id="status">待機中</span>
     </div>
@@ -77,8 +78,9 @@ footer{max-width:960px;margin:0 auto;padding:0 16px 24px;color:var(--muted);font
     <div class="big"><span class="num" id="rps">--</span><span class="unit">RPS（中央値）</span></div>
     <div class="stats">
       <div class="stat"><b id="rpm">--</b><span>RPM（毎分）</span></div>
-      <div class="stat"><b id="avgRps">--</b><span>平均RPS（初弾〜最終弾）</span></div>
-      <div class="stat"><b id="shots">--</b><span>検出した発射数</span></div>
+      <div class="stat"><b id="avgRps">--</b><span>平均RPS（連射区間）</span></div>
+      <div class="stat"><b id="shots">--</b><span>連射区間の発射数 / 全検出</span></div>
+      <div class="stat"><b id="burstSpan">--</b><span>連射区間 (秒)</span></div>
       <div class="stat"><b id="interval">--</b><span>間隔 中央値 (ms)</span></div>
       <div class="stat"><b id="jitter">--</b><span>間隔のばらつき ±ms</span></div>
       <div class="stat"><b id="range">--</b><span>RPS 最小〜最大</span></div>
@@ -89,7 +91,7 @@ footer{max-width:960px;margin:0 auto;padding:0 16px 24px;color:var(--muted);font
   <section class="card">
     <h2>波形と検出ピーク</h2>
     <canvas id="wave"></canvas>
-    <p class="hint">ドラッグで解析範囲を選択（トリガーの音や雑音を除外）。タップで選択解除。</p>
+    <p class="hint">色付きの帯が自動検出した連射区間（最も長く続いた連射）です。単発や雑音は灰色で表示され、計算から除外されます。ドラッグで解析範囲を手動で絞ることもできます。タップで選択解除。</p>
     <div class="row" style="margin-top:8px">
       <button id="zoomBtn" disabled>選択範囲を拡大</button>
       <button id="fullBtn" disabled>全体表示</button>
@@ -126,6 +128,7 @@ let sel = null;        // [t0, t1] 秒
 let view = [0, 1];     // 表示範囲 秒
 let peaks = [];        // 秒
 let thrAbs = 0;
+let burst = null;      // [開始index, 終了index]（peaks内）
 let mediaRec = null, chunks = [], stream = null, recTimer = null, recStart = 0;
 let analyser = null, meterRAF = 0, playSrc = null;
 
@@ -255,22 +258,43 @@ function detect(){
 
 function median(a){ const s = [...a].sort((x, y) => x - y), m = s.length >> 1; return s.length % 2 ? s[m] : (s[m - 1] + s[m]) / 2; }
 
+// 連射区間の検出：間隔が中央値の2.5倍（最低120ms）を超えたら区切り、最も発射数の多い塊を採用
+function findBurst(){
+  if(peaks.length < 2) return null;
+  const all = []; for(let i = 1; i < peaks.length; i++) all.push(peaks[i] - peaks[i - 1]);
+  const limit = Math.max(median(all) * 2.5, 0.12);
+  let best = null, s = 0;
+  for(let i = 1; i <= peaks.length; i++){
+    if(i === peaks.length || peaks[i] - peaks[i - 1] > limit){
+      if(!best || i - 1 - s > best[1] - best[0]) best = [s, i - 1];
+      s = i;
+    }
+  }
+  return best[1] > best[0] ? best : null;
+}
+
+const STAT_IDS = ['#rps','#rpm','#avgRps','#interval','#jitter','#range','#shots','#burstSpan'];
+function clearStats(){ STAT_IDS.forEach(s => $(s).textContent = '--'); }
+
 function analyze(){
   if(!env) return;
   detect();
-  const d = []; for(let i = 1; i < peaks.length; i++) d.push(peaks[i] - peaks[i - 1]);
+  burst = findBurst();
+  const d = [];
+  if(burst) for(let i = burst[0] + 1; i <= burst[1]; i++) d.push(peaks[i] - peaks[i - 1]);
   const set = (id, v) => $(id).textContent = v;
-  set('#shots', peaks.length || '0');
+  set('#shots', (burst ? burst[1] - burst[0] + 1 : 0) + ' / ' + peaks.length);
   if(d.length < 1){
-    ['#rps','#rpm','#avgRps','#interval','#jitter','#range'].forEach(s => set(s, '--'));
+    ['#rps','#rpm','#avgRps','#interval','#jitter','#range','#burstSpan'].forEach(s => set(s, '--'));
   }else{
+    set('#burstSpan', peaks[burst[0]].toFixed(2) + '〜' + peaks[burst[1]].toFixed(2));
     const med = median(d), rps = 1 / med;
     const mean = d.reduce((a, b) => a + b, 0) / d.length;
     const sd = Math.sqrt(d.reduce((a, b) => a + (b - mean) ** 2, 0) / d.length);
     const r = d.map(x => 1 / x);
     set('#rps', rps.toFixed(1));
     set('#rpm', Math.round(rps * 60).toLocaleString());
-    set('#avgRps', ((peaks.length - 1) / (peaks[peaks.length - 1] - peaks[0])).toFixed(1));
+    set('#avgRps', ((burst[1] - burst[0]) / (peaks[burst[1]] - peaks[burst[0]])).toFixed(1));
     set('#interval', (med * 1000).toFixed(1));
     set('#jitter', (sd * 1000).toFixed(1));
     set('#range', Math.min(...r).toFixed(1) + '〜' + Math.max(...r).toFixed(1));
@@ -302,6 +326,11 @@ function drawWave(){
   const [v0, v1] = view, axisH = 18, h = H - axisH, mid = h / 2;
   const t2x = t => (t - v0) / (v1 - v0) * W;
   if(sel){ g.fillStyle = cssVar('--sel'); g.fillRect(t2x(sel[0]), 0, t2x(sel[1]) - t2x(sel[0]), h); }
+  if(burst){
+    g.fillStyle = cssVar('--thr'); g.globalAlpha = .12;
+    const bx = t2x(peaks[burst[0]]); g.fillRect(bx, 0, t2x(peaks[burst[1]]) - bx, h);
+    g.globalAlpha = 1;
+  }
   const scale = (mid - 4) / (envMax || 1);
   g.fillStyle = cssVar('--wave');
   for(let x = 0; x < W; x++){
@@ -316,9 +345,12 @@ function drawWave(){
   g.moveTo(0, mid - ty); g.lineTo(W, mid - ty); g.moveTo(0, mid + ty); g.lineTo(W, mid + ty); g.stroke();
   g.setLineDash([]);
   // ピーク
-  g.strokeStyle = cssVar('--peak'); g.fillStyle = cssVar('--peak');
-  for(const p of peaks){
+  const cIn = cssVar('--peak'), cOut = cssVar('--muted');
+  for(let k = 0; k < peaks.length; k++){
+    const p = peaks[k];
     if(p < v0 || p > v1) continue;
+    const inB = burst && k >= burst[0] && k <= burst[1];
+    g.strokeStyle = g.fillStyle = inB ? cIn : cOut;
     const x = t2x(p); g.globalAlpha = .55; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, h); g.stroke();
     g.globalAlpha = 1; g.beginPath(); g.arc(x, 5, 3, 0, Math.PI * 2); g.fill();
   }
@@ -376,6 +408,20 @@ $('#playBtn').onclick = () => {
   if(playSrc){ try{ playSrc.stop(); }catch(e){} playSrc = null; }
   playSrc = ctx.createBufferSource(); playSrc.buffer = buffer; playSrc.connect(ctx.destination);
   const [a, b] = sel || [0, buffer.duration]; playSrc.start(0, a, b - a);
+};
+
+/* ---------- リセット ---------- */
+$('#resetBtn').onclick = () => {
+  if(mediaRec && mediaRec.state === 'recording'){ mediaRec.onstop = null; mediaRec.stop(); }
+  if(stream) stream.getTracks().forEach(t => t.stop());
+  clearInterval(recTimer); cancelAnimationFrame(meterRAF); $('#meterBar').style.width = '0';
+  $('#recBtn').textContent = '● 録音開始'; $('#recBtn').classList.remove('recording');
+  if(playSrc){ try{ playSrc.stop(); }catch(e){} playSrc = null; }
+  buffer = mono = env = null; peaks = []; burst = null; sel = null; thrAbs = 0; view = [0, 1];
+  $('#thr').value = 35; $('#gap').value = 15; $('#hp').checked = true; syncLabels();
+  ['#zoomBtn','#fullBtn','#clearBtn','#playBtn'].forEach(s => $(s).disabled = true);
+  $('#warn').textContent = ''; setStatus('待機中');
+  clearStats(); drawWave(); drawRps(null);
 };
 
 /* ---------- 設定 ---------- */
